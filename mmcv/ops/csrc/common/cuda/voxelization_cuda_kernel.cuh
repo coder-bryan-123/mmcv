@@ -92,45 +92,176 @@ __global__ void assign_voxel_coors(const int nthreads, T_int* coor,
 }
 
 template <typename T_int>
-__global__ void point_to_voxelidx_kernel(const T_int* coor,
-                                         T_int* point_to_voxelidx,
-                                         T_int* point_to_pointidx,
+struct PointCoord {
+    T_int x, y, z;
+    int original_idx;
+
+    __host__ __device__
+    bool operator<(const PointCoord& other) const {
+        if (x != other.x) return x < other.x;
+        if (y != other.y) return y < other.y;
+        if (z != other.z) return z < other.z;
+        return original_idx < other.original_idx;  // stable sort
+    }
+    __host__ __device__
+    bool operator==(const PointCoord& other) const {
+      return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+// functor to avoid device lambda which need extra --extended-lambda flag in nvcc
+template <typename T_int>
+struct CoordTransformer {
+    const T_int* coor_ptr;
+    
+    __host__ __device__
+    PointCoord<T_int> operator()(int idx) const {
+        PointCoord<int> pc;
+        pc.x = coor_ptr[idx * 3];
+        pc.y = coor_ptr[idx * 3 + 1];
+        pc.z = coor_ptr[idx * 3 + 2];
+        pc.original_idx = idx;
+        return pc;
+    }
+};
+
+template <typename T_int>
+__global__ void point_to_voxelidx_with_sort_kernel(
+    const PointCoord<T_int>* __restrict__ sorted_coords,
+    T_int* __restrict__ point_to_voxelidx,
+    T_int* __restrict__ point_to_pointidx,
+    const int max_points,
+    const int max_voxels,
+    const int num_points) {
+    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // if (idx >= num_points) return;
+    CUDA_1D_KERNEL_LOOP(index, num_points) {
+      auto current_coord = sorted_coords[index];
+      if (current_coord.x == -1) continue;
+
+      int equal_start = index;
+      while (equal_start > 0 && sorted_coords[equal_start - 1] == current_coord) {
+        equal_start--;
+      }
+
+      int pos_in_voxel = index - equal_start;
+      T_int original_idx = __ldg(&current_coord.original_idx);
+
+      if (pos_in_voxel < max_points) {
+        point_to_pointidx[original_idx] = __ldg(&sorted_coords[equal_start].original_idx);
+        point_to_voxelidx[original_idx] = pos_in_voxel;
+      }
+    }
+}
+
+template <typename T_int, int BLOCK_SIZE>
+__global__ void point_to_voxelidx_kernel(const T_int* __restrict__ coor,
+                                         T_int* __restrict__ point_to_voxelidx,
+                                         T_int* __restrict__ point_to_pointidx,
                                          const int max_points,
                                          const int max_voxels,
                                          const int num_points, const int NDim) {
-  CUDA_1D_KERNEL_LOOP(index, num_points) {
-    auto coor_offset = coor + index * NDim;
-    // skip invalid points
-    if (coor_offset[0] == -1) continue;
+  struct __align__(16) Coor
+  {
+    T_int x, y, z;
+    T_int pad;
+  };
+  __shared__ Coor shared_coor[BLOCK_SIZE];
 
+  constexpr uint32_t elements_in_128b = 16 / sizeof(T_int);
+  union BLOCK_16B
+  {
+    T_int e[elements_in_128b];
+      __uint128_t ow;
+  };
+
+  int global_loop_cnt = (num_points + blockDim.x * gridDim.x - 1) / (blockDim.x * gridDim.x);
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int global_idx = 0; global_idx < global_loop_cnt; global_idx++) {
+    bool is_valid = false;
     int num = 0;
-    int coor_x = coor_offset[0];
-    int coor_y = coor_offset[1];
-    int coor_z = coor_offset[2];
-    // only calculate the coors before this coor[index]
-    for (int i = 0; i < index; ++i) {
-      auto prev_coor = coor + i * NDim;
-      if (prev_coor[0] == -1) continue;
+    int first_match_idx = index;
+    T_int coor_x = -1;
+    T_int coor_y = -1;
+    T_int coor_z = -1;
 
-      // Find all previous points that have the same coors
-      // if find the same coor, record it
-      if ((prev_coor[0] == coor_x) && (prev_coor[1] == coor_y) &&
-          (prev_coor[2] == coor_z)) {
-        num++;
-        if (num == 1) {
-          // point to the same coor that first show up
-          point_to_pointidx[index] = i;
-        } else if (num >= max_points) {
-          // out of boundary
-          break;
+    if (index < num_points) {
+      auto coor_offset = coor + index * NDim;
+      // skip invalid points
+      coor_x = __ldg(&coor_offset[0]);
+      is_valid = (coor_x != -1);
+      coor_y = __ldg(&coor_offset[1]);
+      coor_z = __ldg(&coor_offset[2]);
+    }
+
+#pragma unroll
+    for (int block_start = 0; block_start < num_points; block_start += BLOCK_SIZE) {
+      // load coor to shared buffer
+      int load_pos = block_start + threadIdx.x;
+      if (load_pos < num_points) {
+        auto prev_coor = coor + load_pos * NDim;
+        shared_coor[threadIdx.x].x = __ldg(&prev_coor[0]);
+        shared_coor[threadIdx.x].y = __ldg(&prev_coor[1]);
+        shared_coor[threadIdx.x].z = __ldg(&prev_coor[2]);
+      }
+      __syncthreads();
+
+      // only calculate the coors before this coor[index]
+      if (is_valid) {
+        BLOCK_16B v_ptr;
+        // int block_end = min(block_start + BLOCK_SIZE, index);
+        int block_end = min(min(block_start + BLOCK_SIZE, num_points), index);
+#pragma unroll
+        for (int i  = 0; i < block_end - block_start; i++) {
+          // Find all previous points that have the same coors
+          // if find the same coor, record it
+          v_ptr.ow = *((const __uint128_t*)(shared_coor + i));
+          bool is_match = (v_ptr.e[0] == coor_x) && (v_ptr.e[1] == coor_y) &&
+                            (v_ptr.e[2] == coor_z);
+          num += is_match ? 1 : 0;
+          if (is_match && num == 1) {
+            first_match_idx = block_start + i;
+          } else if (is_match && num >= max_points) {
+            // out of boundary
+            break;
+          }
         }
       }
+      __syncthreads();
     }
-    if (num == 0) {
-      point_to_pointidx[index] = index;
+
+    if (is_valid && index < num_points) {
+      point_to_pointidx[index] = first_match_idx;
+      if (num < max_points) {
+        point_to_voxelidx[index] = num;
+      }
     }
-    if (num < max_points) {
-      point_to_voxelidx[index] = num;
+
+    index += blockDim.x * gridDim.x;
+  }
+}
+
+template <typename T_int>
+__global__ void mark_new_voxels(const T_int* point_to_voxelidx, bool* need_new_voxel,
+                                  const int num_points) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_points) return;
+  need_new_voxel[i] = (point_to_voxelidx[i] == 0);
+}
+
+template <typename T_int>
+__global__ void update_voxels(T_int* num_points_per_voxel, T_int* coor_to_voxelidx,
+                                const T_int* point_to_voxelidx, const int* voxel_indices,
+                                const int max_voxels, const int num_points) {
+  CUDA_1D_KERNEL_LOOP(index, num_points) {
+    int point_pos_in_voxel = point_to_voxelidx[index];
+    if (point_pos_in_voxel == -1) continue;
+    if (point_pos_in_voxel == 0) {
+      int voxelidx = voxel_indices[index];
+      if (voxelidx < max_voxels) {
+        coor_to_voxelidx[index] = voxelidx;
+        num_points_per_voxel[voxelidx] = 1;
+      }
     }
   }
 }
@@ -139,29 +270,18 @@ template <typename T_int>
 __global__ void determin_voxel_num(
     // const T_int* coor,
     T_int* num_points_per_voxel, T_int* point_to_voxelidx,
-    T_int* point_to_pointidx, T_int* coor_to_voxelidx, T_int* voxel_num,
+    T_int* point_to_pointidx, T_int* coor_to_voxelidx,
+    const int* voxel_indices,
     const int max_points, const int max_voxels, const int num_points) {
-  // only calculate the coors before this coor[index]
-  for (int i = 0; i < num_points; ++i) {
-    int point_pos_in_voxel = point_to_voxelidx[i];
-    // record voxel
-    if (point_pos_in_voxel == -1) {
-      // out of max_points or invalid point
-      continue;
-    } else if (point_pos_in_voxel == 0) {
-      // record new voxel
-      int voxelidx = voxel_num[0];
-      if (voxel_num[0] >= max_voxels) continue;
-      voxel_num[0] += 1;
-      coor_to_voxelidx[i] = voxelidx;
-      num_points_per_voxel[voxelidx] = 1;
-    } else {
-      int point_idx = point_to_pointidx[i];
-      int voxelidx = coor_to_voxelidx[point_idx];
-      if (voxelidx != -1) {
-        coor_to_voxelidx[i] = voxelidx;
-        num_points_per_voxel[voxelidx] += 1;
-      }
+  CUDA_1D_KERNEL_LOOP(index, num_points) {
+    int point_pos_in_voxel = point_to_voxelidx[index];
+    if (point_pos_in_voxel == -1 || point_pos_in_voxel == 0) continue;
+
+    int point_idx = point_to_pointidx[index];
+    int voxelidx = coor_to_voxelidx[point_idx];
+    if (voxelidx != -1) {
+      coor_to_voxelidx[index] = voxelidx;
+      atomicAdd(&num_points_per_voxel[voxelidx], 1);
     }
   }
 }

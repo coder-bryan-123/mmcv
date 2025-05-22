@@ -1,6 +1,12 @@
 // Copyright (c) OpenMMLab. All rights reserved.
 #include <stdio.h>
 #include <stdlib.h>
+#include <thrust/scan.h>
+#include <thrust/copy.h>
+#include <thrust/device_vector.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/sort.h>
 
 #include "pytorch_cuda_helper.hpp"
 #include "voxelization_cuda_kernel.cuh"
@@ -68,15 +74,42 @@ int HardVoxelizeForwardCUDAKernelLauncher(
 
   dim3 map_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
   dim3 map_block(512);
-
+ 
+  int64_t total_size = num_points * NDim * temp_coors.element_size();
+  if (total_size > (1ULL << 30)) {
   AT_DISPATCH_ALL_TYPES(
-      temp_coors.scalar_type(), "determin_duplicate", ([&] {
-        point_to_voxelidx_kernel<int><<<map_grid, map_block, 0, stream>>>(
+      temp_coors.scalar_type(), "point_to_voxelidx", ([&] {
+        point_to_voxelidx_kernel<int, 512><<<map_grid, map_block, 0, stream>>>(
             temp_coors.contiguous().data_ptr<int>(),
             point_to_voxelidx.contiguous().data_ptr<int>(),
             point_to_pointidx.contiguous().data_ptr<int>(), max_points,
             max_voxels, num_points, NDim);
       }));
+  } else if (total_size <= (1ULL << 30) && NDim == 3) {
+    // 1. prepare data
+    thrust::device_vector<PointCoord<int>> coords(num_points);
+    auto coords_ptr = thrust::device_pointer_cast(coords.data());
+    auto coor_ptr = thrust::raw_pointer_cast(temp_coors.contiguous().data_ptr<int>());
+
+    thrust::transform(
+        thrust::device,
+        thrust::make_counting_iterator(0),
+        thrust::make_counting_iterator(num_points),
+        coords_ptr,
+        CoordTransformer<int>{coor_ptr}
+    );
+    // 2. sort
+    thrust::sort(thrust::device, coords.begin(), coords.end());
+    // 3. point to voxel
+    AT_DISPATCH_ALL_TYPES(
+        temp_coors.scalar_type(), "point_to_voxelidx_with_sort", ([&] {
+            point_to_voxelidx_with_sort_kernel<int><<<map_grid, map_block, 0, stream>>>(
+                thrust::raw_pointer_cast(coords.data()),
+                point_to_voxelidx.contiguous().data_ptr<int>(),
+                point_to_pointidx.contiguous().data_ptr<int>(),
+                max_points, max_voxels, num_points);
+        }));
+  }
 
   AT_CUDA_CHECK(cudaGetLastError());
 
@@ -87,19 +120,43 @@ int HardVoxelizeForwardCUDAKernelLauncher(
           num_points,
       },
       points.options().dtype(at::kInt));
-  auto voxel_num = at::zeros(
-      {
-          1,
-      },
-      points.options().dtype(at::kInt));  // must be zero from the beginning
+//   auto voxel_num = at::zeros(
+//       {
+//           1,
+//       },
+//       points.options().dtype(at::kInt));  // must be zero from the beginning
 
+  dim3 determin_grid(std::min(at::cuda::ATenCeilDiv(num_points, 512), 4096));
+  dim3 determin_block(512);
+  // i. get if point need update voxel
+  thrust::device_vector<bool> need_new_voxel(num_points);
+  AT_DISPATCH_ALL_TYPES(temp_coors.scalar_type(), "determin_mark_new_voxels", ([&] {
+                            mark_new_voxels<<<determin_grid, determin_block, 0, stream>>>(
+                                point_to_voxelidx.contiguous().data_ptr<int>(),
+                                need_new_voxel.data().get(), num_points
+                            );
+                        }));
+  // ii. exclusive scan
+  thrust::device_vector<int> voxel_indices(num_points);
+  thrust::exclusive_scan(need_new_voxel.begin(), need_new_voxel.end(), voxel_indices.begin(), 0);
+  // iii. update voxels
+  AT_DISPATCH_ALL_TYPES(temp_coors.scalar_type(), "determin_update_voxels", ([&] {
+                            update_voxels<<<determin_grid, determin_block, 0, stream>>>(
+                                num_points_per_voxel.contiguous().data_ptr<int>(),
+                                coor_to_voxelidx.contiguous().data_ptr<int>(),
+                                point_to_voxelidx.contiguous().data_ptr<int>(),
+                                voxel_indices.data().get(),
+                                max_voxels, num_points
+                            );
+                        }));
+  // IV. determin_voxel_num
   AT_DISPATCH_ALL_TYPES(temp_coors.scalar_type(), "determin_duplicate", ([&] {
-                          determin_voxel_num<int><<<1, 1, 0, stream>>>(
+                          determin_voxel_num<int><<<determin_grid, determin_block, 0, stream>>>(
                               num_points_per_voxel.contiguous().data_ptr<int>(),
                               point_to_voxelidx.contiguous().data_ptr<int>(),
                               point_to_pointidx.contiguous().data_ptr<int>(),
                               coor_to_voxelidx.contiguous().data_ptr<int>(),
-                              voxel_num.contiguous().data_ptr<int>(),
+                              voxel_indices.data().get(),
                               max_points, max_voxels, num_points);
                         }));
 
@@ -139,8 +196,11 @@ int HardVoxelizeForwardCUDAKernelLauncher(
 
   AT_CUDA_CHECK(cudaGetLastError());
 
-  auto voxel_num_cpu = voxel_num.to(at::kCPU);
-  int voxel_num_int = voxel_num_cpu.data_ptr<int>()[0];
+  int voxel_indices_last = 0;
+  int need_new_voxel_last = 0;
+  thrust::copy(voxel_indices.end() - 1, voxel_indices.end(), &voxel_indices_last);
+  thrust::copy(need_new_voxel.end() - 1, need_new_voxel.end(), &need_new_voxel_last);
+  int voxel_num_int = voxel_indices_last + need_new_voxel_last;
 
   return voxel_num_int;
 }
